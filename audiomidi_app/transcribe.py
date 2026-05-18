@@ -6,7 +6,7 @@ from typing import Protocol
 
 import numpy as np
 from scipy.ndimage import median_filter
-from scipy.signal import find_peaks, resample_poly, stft
+from scipy.signal import find_peaks, resample_poly, stft, butter, sosfilt
 
 from audiomidi_app.midi import NoteEvent
 
@@ -80,25 +80,34 @@ def hz_to_midi_with_cents(freq_hz: float) -> tuple[int, float]:
 
 
 def compute_harmonic_salience(
-    mag: np.ndarray,
+    mag_linear: np.ndarray,
     f: np.ndarray,
-    harmonic_weight: float = 1.5,
     n_harmonics: int = 8,
+    harmonic_decay: float = 0.8,
 ) -> np.ndarray:
-    sal = mag.copy()
-    band = (f >= 50) & (f <= 4200)
-    f_band = f[band]
-    mag_band = mag[band, :]
+    """每个频率 bin 叠加其谐波列的能量，得到基频显著度。
     
-    for i, (freq, mag_col) in enumerate(zip(f_band, mag_band.T)):
-        if freq < 50:
-            continue
-        for h in range(2, n_harmonics + 1):
-            harmonic_freq = freq * h
-            idx = np.argmin(np.abs(f_band - harmonic_freq))
-            if abs(f_band[idx] - harmonic_freq) < harmonic_freq * 0.05:
-                sal[band, i] += mag_band[idx, i] * (harmonic_weight / h)
-    
+    Args:
+        mag_linear: 线性幅度，shape (n_freq, n_frames)
+        f: 频率轴，shape (n_freq,)
+        n_harmonics: 考虑的谐波数量
+        harmonic_decay: 谐波权重衰减系数
+        
+    Returns:
+        salience: 谐波显著度，shape (n_freq, n_frames)
+    """
+    weights = harmonic_decay ** np.arange(n_harmonics)
+    weights /= weights.sum()
+
+    sal = np.zeros_like(mag_linear)
+    for h_idx in range(n_harmonics):
+        h = h_idx + 1
+        target = f * h
+        j = np.searchsorted(f, target, side="left")
+        # 只保留有效范围内的谐波，不clip到最后一个bin（否则会污染高频）
+        valid = (j >= 0) & (j < len(f))
+        sal[valid, :] += mag_linear[j[valid], :] * weights[h_idx]
+
     return sal
 
 
@@ -126,36 +135,38 @@ def detect_bpm(samples: np.ndarray, sr: int) -> float:
         return 120.0
 
 
-def separate_audio(
-    audio_path: str,
-    model: str = "htdemucs",
-    device: str = "cpu",
-) -> dict[str, str] | None:
+def _bandpass(samples: np.ndarray, sr: int, lo: float, hi: float) -> np.ndarray:
+    nyq = sr / 2.0
+    sos = butter(4, [lo / nyq, min(hi / nyq, 0.99)], btype="band", output="sos")
+    return sosfilt(sos, samples)
+
+
+def transcribe_drums(samples: np.ndarray, sr: int) -> list[NoteEvent]:
     try:
-        from demucs.pretrained import get_model
-        from demucs.separate import Separator
-        from pathlib import Path
-        import os
+        import librosa
     except ImportError:
-        return None
-    
-    try:
-        model_instance = get_model(model)
-        stem_paths = {}
-        
-        separator_instance = Separator(model_instance, device=device)
-        wavs = separator_instance.separate(audio_path)
-        
-        for stem_name, stem_wav in wavs.items():
-            if stem_wav is not None and len(stem_wav) > 0:
-                temp_path = Path(tempfile.gettempdir()) / f"demucs_{stem_name}.wav"
-                import soundfile as sf
-                sf.write(str(temp_path), stem_wav, 44100)
-                stem_paths[stem_name] = str(temp_path)
-        
-        return stem_paths if stem_paths else None
-    except Exception:
-        return None
+        return []
+
+    bands = {
+        36: (40,  200),    # Kick
+        38: (200, 2000),   # Snare
+        42: (6000, 16000), # Hi-Hat
+    }
+
+    events = []
+    for gm_note, (flo, fhi) in bands.items():
+        y_band = _bandpass(samples, sr, flo, min(fhi, sr / 2 - 1))
+        times = librosa.onset.onset_detect(
+            y=y_band, sr=sr, hop_length=256,
+            backtrack=True, units="time"
+        )
+        for t in times:
+            t = max(0.0, float(t))
+            events.append(NoteEvent(note=gm_note, start_s=t,
+                                    end_s=t + 0.05, velocity=90))
+
+    events.sort(key=lambda e: e.start_s)
+    return events
 
 
 class SpectralPeaksTranscriber:
@@ -170,8 +181,10 @@ class SpectralPeaksTranscriber:
             x = x.mean(axis=-1)
         
         onset_frames = np.array([], dtype=int)
+        onset_set = set()
         if self._cfg.use_onset_detection:
             onset_frames = detect_onsets(x, sample_rate, self._cfg.hop_length)
+            onset_set = set(onset_frames.tolist())
         
         f, t, z = stft(
             x,
@@ -199,7 +212,7 @@ class SpectralPeaksTranscriber:
         events: list[NoteEvent] = []
         
         for frame_i in range(mag_db.shape[1]):
-            is_onset = frame_i in onset_frames
+            is_onset = frame_i in onset_set
             
             frame_db = mag_db[:, frame_i]
             frame_mag = mag[:, frame_i]
@@ -298,37 +311,42 @@ class HarmonicSalienceTranscriber:
             x = x.mean(axis=-1)
         
         onset_frames = np.array([], dtype=int)
+        onset_set = set()
         if self._cfg.use_onset_detection:
             onset_frames = detect_onsets(x, sample_rate, self._cfg.hop_length)
+            onset_set = set(onset_frames.tolist())
         
         if self._cfg.use_cqt:
             try:
                 import librosa
+                n_bins = 288  # 36 bins/octave × 8 octaves
                 cqt = librosa.cqt(
                     x,
                     sr=sample_rate,
                     hop_length=self._cfg.hop_length,
                     fmin=librosa.note_to_hz('A0'),
-                    n_bins=96,
-                    bins_per_octave=12
+                    n_bins=n_bins,
+                    bins_per_octave=36
                 )
                 mag = np.abs(cqt) + 1e-12
-                f = librosa.cqt_frequencies(96, fmin=librosa.note_to_hz('A0'), bins_per_octave=12)
+                f = librosa.cqt_frequencies(n_bins, fmin=librosa.note_to_hz('A0'), bins_per_octave=36)
             except ImportError:
                 mag, f = self._compute_stft_mag(x, sample_rate)
         else:
             mag, f = self._compute_stft_mag(x, sample_rate)
         
-        mag_db = 20.0 * np.log10(mag)
+        # 把 harmonic_weight 转换为合理的 harmonic_decay
+        # harmonic_weight 越大，高阶谐波权重越高（decay越慢）
+        harmonic_decay = 1.0 - (1.0 / (self._cfg.harmonic_weight + 0.5))
+        salience = compute_harmonic_salience(mag, f, n_harmonics=8, harmonic_decay=harmonic_decay)
+        sal_db = 20.0 * np.log10(salience + 1e-12)
         
         if self._cfg.use_temporal_smoothing:
-            mag_db = median_filter(mag_db, size=(1, 3))
-        
-        salience = compute_harmonic_salience(mag_db, f, self._cfg.harmonic_weight)
+            sal_db = median_filter(sal_db, size=(1, 3))
         
         band = (f >= self._cfg.fmin_hz) & (f <= self._cfg.fmax_hz)
         f_band = f[band]
-        salience = salience[band, :]
+        sal_band = sal_db[band, :]
         mag_band = mag[band, :]
         
         dt = float(self._cfg.hop_length) / float(sample_rate)
@@ -336,10 +354,10 @@ class HarmonicSalienceTranscriber:
         active: dict[int, tuple[float, float, float]] = {}
         events: list[NoteEvent] = []
         
-        for frame_i in range(salience.shape[1]):
-            is_onset = frame_i in onset_frames
+        for frame_i in range(sal_band.shape[1]):
+            is_onset = frame_i in onset_set
             
-            frame_sal = salience[:, frame_i]
+            frame_sal = sal_band[:, frame_i]
             frame_mag = mag_band[:, frame_i]
             
             peaks, props = find_peaks(
@@ -410,10 +428,10 @@ class HarmonicSalienceTranscriber:
                 if n not in active:
                     active[n] = (now_s, now_s, amp)
         
-        end_s = salience.shape[1] * dt
+        end_s = sal_band.shape[1] * dt
         for n, (start_s, last_s, max_amp) in active.items():
             last = min(end_s, last_s)
-            dur = last - start_s
+            dur = last_s - start_s
             if dur >= self._cfg.min_note_s:
                 events.append(
                     NoteEvent(
@@ -454,43 +472,6 @@ def amp_to_velocity(amp: float, mode: str = "linear") -> int:
         db = 20.0 * np.log10(max(1e-9, amp))
         v = int(np.clip((db + 60.0) * 2.2, 1.0, 127.0))
     return max(1, min(127, int(v)))
-
-
-def transcribe_drums(samples: np.ndarray, sr: int) -> list[NoteEvent]:
-    try:
-        import librosa
-    except ImportError:
-        return []
-    
-    bands = {
-        36: (20, 100),
-        38: (100, 500),
-        42: (5000, 16000),
-    }
-    
-    events = []
-    onset_times = set()
-    
-    for gm_note, (flo, fhi) in bands.items():
-        onset_frames = librosa.onset.onset_detect(
-            y=samples,
-            sr=sr,
-            hop_length=256,
-            backtrack=True,
-            units="time"
-        )
-        for t in onset_frames:
-            if abs(t) not in onset_times:
-                onset_times.add(abs(t))
-                events.append(NoteEvent(
-                    note=gm_note,
-                    start_s=float(t) if t >= 0 else 0.0,
-                    end_s=float(t) + 0.05 if t >= 0 else 0.05,
-                    velocity=90
-                ))
-    
-    events.sort(key=lambda e: e.start_s)
-    return events
 
 
 def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
@@ -545,11 +526,14 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
     class _PianoTranscriptionTranscriber:
         name = "Piano Transcription"
 
+        def __init__(self):
+            from piano_transcription_inference import PianoTranscription
+            self._model = PianoTranscription(device="cpu", duration=None)
+
         def transcribe(self, samples: np.ndarray, sample_rate_in: int) -> list[NoteEvent]:
-            import tempfile
             import soundfile as sf
             from pathlib import Path
-            from piano_transcription_inference import PianoTranscription, sample_rate as PT_SR
+            from piano_transcription_inference import sample_rate as PT_SR
 
             if sample_rate_in != PT_SR:
                 g = np.gcd(sample_rate_in, PT_SR)
@@ -567,8 +551,7 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
             
             try:
                 sf.write(temp_wav, samples, sample_rate_out)
-                transcriptor = PianoTranscription(device="cpu", duration=None)
-                result = transcriptor.transcribe(temp_wav, midi_path=None)
+                result = self._model.transcribe(temp_wav, midi_path=None)
                 
                 events = []
                 for note_info in result["notes"]:
@@ -590,7 +573,7 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
 
 def try_basic_pitch_transcriber() -> Transcriber | None:
     try:
-        from basic_pitch.inference import predict
+        from basic_pitch.inference import predict, predict_and_save
         from basic_pitch import ICASSP_2022_MODEL_PATH
     except Exception:
         return None
@@ -598,8 +581,11 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
     class _BasicPitchTranscriber:
         name = "Basic Pitch"
 
+        def __init__(self):
+            # 预加载模型到内存（如果API支持的话）
+            self._model_path = ICASSP_2022_MODEL_PATH
+
         def transcribe(self, samples: np.ndarray, sample_rate: int) -> list[NoteEvent]:
-            import tempfile
             import soundfile as sf
             from pathlib import Path
 
@@ -608,7 +594,8 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
             
             try:
                 sf.write(temp_wav, samples, sample_rate)
-                model_output, midi_data, note_events = predict(temp_wav, ICASSP_2022_MODEL_PATH)
+                # 虽然我们无法直接避免predict内部重新加载，但至少API调用是一致的
+                model_output, midi_data, note_events = predict(temp_wav, self._model_path)
                 
                 events = []
                 for note in note_events:
@@ -628,7 +615,6 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
         def transcribe_file(self, in_path: str, out_dir: str) -> str:
             import os
             from pathlib import Path
-            from basic_pitch.inference import predict_and_save
 
             out = Path(out_dir)
             out.mkdir(parents=True, exist_ok=True)
@@ -638,7 +624,7 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
                 save_midi=True,
                 save_model_outputs=False,
                 save_notes=False,
-                model_or_model_path=ICASSP_2022_MODEL_PATH,
+                model_or_model_path=self._model_path,
             )
             midi_path = out / (Path(in_path).stem + ".mid")
             if not midi_path.exists():
