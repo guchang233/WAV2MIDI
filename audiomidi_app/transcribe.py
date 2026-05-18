@@ -10,6 +10,27 @@ from scipy.signal import find_peaks, resample_poly, stft, butter, sosfilt
 
 from audiomidi_app.midi import NoteEvent
 from audiomidi_app.postprocess import full_postprocess, PostProcessConfig
+
+class NeuralTranscriber(Protocol):
+    name: str
+    
+    def transcribe(self, samples: np.ndarray, sample_rate: int) -> list[NoteEvent]: ...
+    
+    def get_onset_times(self, samples: np.ndarray, sample_rate: int) -> list[float]:
+        try:
+            import librosa
+            return librosa.onset.onset_detect(
+                y=samples, sr=sample_rate, hop_length=256,
+                backtrack=True, units="time"
+            ).tolist()
+        except Exception:
+            return []
+
+
+class DSPTranscriber(Protocol):
+    name: str
+    
+    def transcribe(self, samples: np.ndarray, sample_rate: int) -> list[NoteEvent]: ...
 from audiomidi_app.voice_separation import (
     separate_voices,
     VoiceSeparationConfig,
@@ -560,20 +581,52 @@ def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
 
 
 def available_transcribers() -> list[Transcriber]:
-    transcribers: list[Transcriber] = [
-        HarmonicSalienceTranscriber(),
-        SpectralPeaksTranscriber(),
-    ]
+    """返回所有可用转录器，按优先级排序。
+    
+    架构分离：
+    - Neural Backend (主): PianoTranscription, BasicPitch
+    - DSP Backend (fallback): HarmonicSalience, SpectralPeaks
+    """
+    transcribers: list[Transcriber] = []
     
     pt = try_piano_transcription_transcriber()
     if pt is not None:
-        transcribers.insert(0, pt)
+        transcribers.append(pt)
     
     bp = try_basic_pitch_transcriber()
     if bp is not None:
         transcribers.append(bp)
     
+    dsp_fallback: list[Transcriber] = [
+        HarmonicSalienceTranscriber(),
+        SpectralPeaksTranscriber(),
+    ]
+    transcribers.extend(dsp_fallback)
+    
     return transcribers
+
+
+def available_neural_transcribers() -> list[NeuralTranscriber]:
+    """仅返回 Neural 模型转录器（推荐）"""
+    neural: list[NeuralTranscriber] = []
+    
+    pt = try_piano_transcription_transcriber()
+    if pt is not None:
+        neural.append(pt)
+    
+    bp = try_basic_pitch_transcriber()
+    if bp is not None and hasattr(bp, 'get_onset_times'):
+        neural.append(bp)
+    
+    return neural
+
+
+def available_dsp_transcribers() -> list[DSPTranscriber]:
+    """返回 DSP fallback 转录器"""
+    return [
+        HarmonicSalienceTranscriber(),
+        SpectralPeaksTranscriber(),
+    ]
 
 
 def available_voice_separation_transcribers(
@@ -619,19 +672,34 @@ class VoiceSeparationTranscriber:
         return separate_voices(events, self._voice_config)
 
 
-def try_piano_transcription_transcriber() -> Transcriber | None:
+def try_piano_transcription_transcriber() -> NeuralTranscriber | None:
     try:
         from piano_transcription_inference import PianoTranscription
     except Exception:
         return None
 
     class _PianoTranscriptionTranscriber:
-        name = "Piano Transcription"
+        name = "Piano Transcription (Neural)"
+        
+        _onset_times: list[float] = []
 
         def __init__(self):
             from piano_transcription_inference import PianoTranscription
             self._model = PianoTranscription(device="cpu", duration=None)
             self._pedal_config = PedalConfig()
+
+        def get_onset_times(self, samples: np.ndarray, sample_rate: int) -> list[float]:
+            try:
+                import librosa
+                onset_frames = librosa.onset.onset_detect(
+                    y=samples, sr=sample_rate, hop_length=256,
+                    backtrack=True, units="time"
+                )
+                self._onset_times = onset_frames.tolist()
+                return self._onset_times
+            except Exception:
+                self._onset_times = []
+                return []
 
         def transcribe(self, samples: np.ndarray, sample_rate_in: int) -> list[NoteEvent]:
             import soundfile as sf
@@ -640,20 +708,23 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
 
             if sample_rate_in != PT_SR:
                 g = np.gcd(sample_rate_in, PT_SR)
-                samples = resample_poly(
+                samples_resampled = resample_poly(
                     samples, 
                     PT_SR // g, 
                     sample_rate_in // g
                 ).astype(np.float32)
                 sample_rate_out = PT_SR
             else:
+                samples_resampled = samples
                 sample_rate_out = sample_rate_in
+            
+            onset_times = self.get_onset_times(samples_resampled, sample_rate_out)
             
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, mode="wb") as f:
                 temp_wav = f.name
             
             try:
-                sf.write(temp_wav, samples, sample_rate_out)
+                sf.write(temp_wav, samples_resampled, sample_rate_out)
                 result = self._model.transcribe(temp_wav, midi_path=None)
                 
                 events = []
@@ -669,7 +740,13 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
                 
                 events = apply_pedal_correction(events, pedal_events, self._pedal_config)
                 
-                events = full_postprocess(events, samples, PT_SR, config=None)
+                events = full_postprocess(
+                    events, 
+                    samples_resampled, 
+                    sample_rate_out,
+                    onset_times=onset_times,
+                    config=None
+                )
                 
                 events.sort(key=lambda e: (e.start_s, e.note))
                 return events
