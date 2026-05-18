@@ -5,12 +5,13 @@ from dataclasses import dataclass
 import mido
 
 
-@dataclass(frozen=True)
+@dataclass
 class NoteEvent:
     note: int
     start_s: float
     end_s: float
     velocity: int
+    confidence: float = 1.0
 
 
 def events_to_midi(

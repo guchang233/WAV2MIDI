@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
+import bisect
 
 from audiomidi_app.midi import NoteEvent
 
@@ -21,152 +22,211 @@ class PostProcessConfig:
     velocity_savgol_window: int = 5
     velocity_savgol_polyorder: int = 2
     
-    enable_harmonic_masking: bool = True
+    enable_harmonic_confidence: bool = True
+    harmonic_confidence_factor: float = 0.7
     harmonic_order: int = 6
 
 
-def detect_repeated_notes_onset_aware(
+class OnsetDetector:
+    """统一 onset 检测器"""
+    
+    def __init__(self, sample_rate: int = 44100, hop_length: int = 256):
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self._onset_times: list[float] = []
+        self._onset_set: set[float] = set()
+    
+    def detect(self, samples: np.ndarray) -> list[float]:
+        """检测全局 onsets"""
+        try:
+            import librosa
+            self._onset_times = librosa.onset.onset_detect(
+                y=samples,
+                sr=self.sample_rate,
+                hop_length=self.hop_length,
+                backtrack=True,
+                units="time",
+                pre_max=3,
+                post_max=3,
+                pre_avg=3,
+                post_avg=5,
+                delta=0.07,
+                wait=10,
+            ).tolist()
+            
+            self._onset_set = {round(t, 3) for t in self._onset_times}
+            return self._onset_times
+        except Exception:
+            self._onset_times = []
+            self._onset_set = set()
+            return []
+    
+    def find_nearby_onset(self, time: float, threshold: float = 0.08) -> Optional[float]:
+        """用 bisect 找最近的 onset"""
+        if not self._onset_times:
+            return None
+        
+        idx = bisect.bisect_left(self._onset_times, time)
+        
+        candidates = []
+        if idx < len(self._onset_times):
+            candidates.append(self._onset_times[idx])
+        if idx > 0:
+            candidates.append(self._onset_times[idx - 1])
+        
+        best = None
+        min_dist = float('inf')
+        
+        for candidate in candidates:
+            dist = abs(candidate - time)
+            if dist <= threshold and dist < min_dist:
+                best = candidate
+                min_dist = dist
+        
+        return best
+    
+    def has_onset_near(self, time: float, threshold: float = 0.03) -> bool:
+        """检查附近是否有 onset"""
+        rounded = round(time, 3)
+        return rounded in self._onset_set
+
+
+def apply_harmonic_confidence_adjustment(
     events: list[NoteEvent],
-    onset_times: list[float] | None = None,
     config: PostProcessConfig | None = None,
 ) -> list[NoteEvent]:
+    """不删除音符，只调整 harmonic candidate 的 confidence"""
     if config is None:
         config = PostProcessConfig()
     
-    if not events:
+    if not events or not config.enable_harmonic_confidence:
         return events
     
-    onset_set = set()
-    if onset_times:
-        onset_set = {round(t, 3) for t in onset_times}
+    events = sorted(events, key=lambda e: (e.start_s, -e.note))
     
-    events = sorted(events, key=lambda e: (e.start_s, e.note))
-    result: list[NoteEvent] = []
-    
-    by_note: dict[int, list[NoteEvent]] = {}
-    for e in events:
-        by_note.setdefault(e.note, []).append(e)
-    
-    for note_num, note_events in by_note.items():
-        note_events.sort(key=lambda e: e.start_s)
+    adjusted = []
+    for event in events:
+        e = NoteEvent(
+            note=event.note,
+            start_s=event.start_s,
+            end_s=event.end_s,
+            velocity=event.velocity,
+            confidence=event.confidence,
+        )
         
-        active: list[NoteEvent] = []
-        
-        for note in note_events:
-            should_split = False
+        for other in adjusted:
+            if other.end_s < event.start_s - 0.01:
+                continue
             
-            has_clear_onset = False
-            for onset_t in onset_set:
-                if abs(onset_t - note.start_s) <= 0.03:
-                    has_clear_onset = True
+            other_hz = 440.0 * (2.0 ** ((other.note - 69) / 12.0))
+            event_hz = 440.0 * (2.0 ** ((event.note - 69) / 12.0))
+            
+            for h in range(2, config.harmonic_order + 1):
+                harmonic_hz = other_hz * h
+                
+                if abs(harmonic_hz - event_hz) < event_hz * 0.05:
+                    e.confidence *= config.harmonic_confidence_factor
                     break
             
-            if has_clear_onset:
-                gap_to_prev = note.start_s - active[-1].end_s if active else float('inf')
-                
-                if gap_to_prev > config.repeated_note_max_gap_s:
-                    should_split = True
-                elif gap_to_prev > config.min_note_gap_s:
-                    should_split = True
-                elif gap_to_prev <= config.min_note_gap_s and gap_to_prev > 0:
-                    should_split = False
-                else:
-                    should_split = False
-            
-            for active_note in active:
-                gap = note.start_s - active_note.end_s
-                if gap < 0:
-                    overlap = active_note.end_s - note.start_s
-                    if overlap > 0.015:
-                        if has_clear_onset:
-                            should_split = True
-                        break
-            
-            active = [n for n in active if n.end_s > note.start_s - 0.001]
-            
-            if should_split and has_clear_onset:
-                result.append(note)
-                active.append(note)
-            else:
-                if active:
-                    merged_end = max(active[-1].end_s, note.end_s)
-                    merged_velocity = max(active[-1].velocity, note.velocity)
-                    
-                    if note.start_s > active[-1].start_s:
-                        active[-1] = NoteEvent(
-                            note=note.note,
-                            start_s=active[-1].start_s,
-                            end_s=merged_end,
-                            velocity=merged_velocity,
-                        )
-                else:
-                    result.append(note)
-                    active.append(note)
+            if e.confidence < 0.4:
+                break
         
-        for active_note in active:
-            if active_note not in result:
-                result.append(active_note)
+        adjusted.append(e)
     
-    result.sort(key=lambda e: (e.start_s, e.note))
-    return result
+    return adjusted
 
 
-def refine_onsets_by_pitch(
+def refine_onsets_from_global_detector(
     events: list[NoteEvent],
-    samples: np.ndarray,
-    sample_rate: int,
+    onset_detector: OnsetDetector,
     config: PostProcessConfig | None = None,
 ) -> list[NoteEvent]:
+    """从全局 onset detector 中精调，而不是 per-note 检测"""
     if config is None:
         config = PostProcessConfig()
     
     if not events:
-        return events
-    
-    try:
-        import librosa
-    except ImportError:
         return events
     
     refined_events: list[NoteEvent] = []
     
     for event in events:
         onset_time = event.start_s
-        pitch_hz = 440.0 * (2.0 ** ((event.note - 69) / 12.0))
         
-        fmin = pitch_hz * 0.9
-        fmax = pitch_hz * 1.1
-        
-        onset_frames = librosa.onset.onset_detect(
-            y=samples,
-            sr=sample_rate,
-            hop_length=256,
-            backtrack=True,
-            units="time",
-            pre_max=3,
-            post_max=3,
-            pre_avg=3,
-            post_avg=5,
-            delta=0.07,
-            wait=10,
+        nearby_onset = onset_detector.find_nearby_onset(
+            onset_time, 
+            threshold=config.onset_refinement_threshold_s * 8
         )
         
-        nearby_onsets = [t for t in onset_frames if abs(t - onset_time) <= 0.08]
-        
-        if nearby_onsets:
-            best_onset = min(nearby_onsets, key=lambda t: abs(t - onset_time))
-            
-            if abs(best_onset - onset_time) <= config.onset_refinement_threshold_s:
-                onset_time = best_onset
+        if nearby_onset is not None:
+            if abs(nearby_onset - onset_time) <= config.onset_refinement_threshold_s:
+                onset_time = nearby_onset
         
         refined_events.append(NoteEvent(
             note=event.note,
             start_s=onset_time,
             end_s=event.end_s,
             velocity=event.velocity,
+            confidence=event.confidence,
         ))
     
     return refined_events
+
+
+def detect_repeated_notes_simple(
+    events: list[NoteEvent],
+    onset_detector: OnsetDetector,
+    config: PostProcessConfig | None = None,
+) -> list[NoteEvent]:
+    """简化核心：new onset + existing sustain = repeated note"""
+    if config is None:
+        config = PostProcessConfig()
+    
+    if not events:
+        return events
+    
+    events = sorted(events, key=lambda e: (e.note, e.start_s))
+    result: list[NoteEvent] = []
+    
+    for note_num in sorted({e.note for e in events}):
+        note_events = [e for e in events if e.note == note_num]
+        note_events.sort(key=lambda e: e.start_s)
+        
+        current: Optional[NoteEvent] = None
+        
+        for event in note_events:
+            has_clear_onset = onset_detector.has_onset_near(
+                event.start_s, 
+                threshold=0.025
+            )
+            
+            if current is None:
+                current = event
+                continue
+            
+            gap = event.start_s - current.end_s
+            
+            if has_clear_onset:
+                result.append(current)
+                current = event
+            else:
+                if gap <= config.min_note_gap_s:
+                    current = NoteEvent(
+                        note=current.note,
+                        start_s=current.start_s,
+                        end_s=max(current.end_s, event.end_s),
+                        velocity=max(current.velocity, event.velocity),
+                        confidence=max(current.confidence, event.confidence),
+                    )
+                else:
+                    result.append(current)
+                    current = event
+        
+        if current is not None:
+            result.append(current)
+    
+    result.sort(key=lambda e: (e.start_s, e.note))
+    return result
 
 
 def smooth_velocities_savgol(
@@ -197,7 +257,6 @@ def smooth_velocities_savgol(
             continue
         
         velocities = [e.velocity for _, e in indexed_events]
-        times = [e.start_s for _, e in indexed_events]
         
         window = min(config.velocity_savgol_window, len(velocities) if len(velocities) % 2 == 1 else len(velocities) - 1)
         if window < 3:
@@ -215,76 +274,12 @@ def smooth_velocities_savgol(
                     start_s=event.start_s,
                     end_s=event.end_s,
                     velocity=int(smoothed[idx]),
+                    confidence=event.confidence,
                 )
         except Exception:
             pass
     
     return result
-
-
-def apply_harmonic_masking(
-    events: list[NoteEvent],
-    samples: np.ndarray | None = None,
-    sample_rate: int = 44100,
-    config: PostProcessConfig | None = None,
-) -> list[NoteEvent]:
-    if config is None:
-        config = PostProcessConfig()
-    
-    if not events or not config.enable_harmonic_masking:
-        return events
-    
-    events = sorted(events, key=lambda e: e.start_s)
-    
-    filtered: list[NoteEvent] = []
-    active_notes: dict[int, tuple[float, float]] = {}
-    
-    for event in events:
-        should_include = True
-        
-        note_hz = 440.0 * (2.0 ** ((event.note - 69) / 12.0))
-        
-        for active_note, (start, end) in list(active_notes.items()):
-            if end < event.start_s - 0.01:
-                continue
-            
-            active_hz = 440.0 * (2.0 ** ((active_note - 69) / 12.0))
-            
-            for h in range(2, config.harmonic_order + 1):
-                harmonic_hz = active_hz * h
-                
-                if abs(harmonic_hz - note_hz) < note_hz * 0.05:
-                    is_harmonic = True
-                    
-                    for other_note, (other_start, other_end) in active_notes.items():
-                        if other_note == active_note:
-                            continue
-                        if other_end < event.start_s - 0.01:
-                            continue
-                        
-                        other_hz = 440.0 * (2.0 ** ((other_note - 69) / 12.0))
-                        
-                        if abs(other_hz - harmonic_hz) < harmonic_hz * 0.02:
-                            is_harmonic = False
-                            break
-                    
-                    if is_harmonic:
-                        should_include = False
-                        break
-            
-            if not should_include:
-                break
-        
-        active_notes = {
-            n: (s, e) for n, (s, e) in active_notes.items()
-            if e > event.start_s - 0.01
-        }
-        
-        if should_include:
-            filtered.append(event)
-            active_notes[event.note] = (event.start_s, event.end_s)
-    
-    return filtered
 
 
 def quantize_onsets_gentle(
@@ -316,21 +311,23 @@ def quantize_onsets_gentle(
             start_s=start_s,
             end_s=event.end_s,
             velocity=event.velocity,
+            confidence=event.confidence,
         ))
     
     return quantized
 
 
-def merge_overlaps_onset_aware(
+def merge_overlaps_onset_confidence_aware(
     events: list[NoteEvent],
-    onset_times: list[float] | None = None,
+    onset_detector: OnsetDetector,
+    config: PostProcessConfig | None = None,
 ) -> list[NoteEvent]:
+    """基于 confidence 和 onset 来 merge，而不是只看 gap"""
+    if config is None:
+        config = PostProcessConfig()
+    
     if not events:
         return events
-    
-    onset_set = set()
-    if onset_times:
-        onset_set = {round(t, 3) for t in onset_times}
     
     events = sorted(events, key=lambda e: (e.note, e.start_s))
     
@@ -349,42 +346,31 @@ def merge_overlaps_onset_aware(
         
         gap = event.start_s - current.end_s
         
-        if gap < 0:
-            overlap = current.end_s - event.start_s
-            if overlap > 0.01:
-                has_separate_onset = False
-                for onset_t in onset_set:
-                    if abs(onset_t - event.start_s) <= 0.025:
-                        has_separate_onset = True
-                        break
-                
-                if has_separate_onset:
-                    merged.append(current)
-                    current = event
-                else:
-                    current = NoteEvent(
-                        note=current.note,
-                        start_s=current.start_s,
-                        end_s=max(current.end_s, event.end_s),
-                        velocity=max(current.velocity, event.velocity),
-                    )
-            else:
+        has_new_onset = onset_detector.has_onset_near(event.start_s, threshold=0.025)
+        
+        if has_new_onset:
+            merged.append(current)
+            current = event
+        else:
+            if gap < 0:
                 current = NoteEvent(
                     note=current.note,
                     start_s=current.start_s,
                     end_s=max(current.end_s, event.end_s),
                     velocity=max(current.velocity, event.velocity),
+                    confidence=max(current.confidence, event.confidence),
                 )
-        elif gap <= 0.03:
-            current = NoteEvent(
-                note=current.note,
-                start_s=current.start_s,
-                end_s=max(current.end_s, event.end_s),
-                velocity=max(current.velocity, event.velocity),
-            )
-        else:
-            merged.append(current)
-            current = event
+            elif gap <= 0.05:
+                current = NoteEvent(
+                    note=current.note,
+                    start_s=current.start_s,
+                    end_s=max(current.end_s, event.end_s),
+                    velocity=max(current.velocity, event.velocity),
+                    confidence=max(current.confidence, event.confidence),
+                )
+            else:
+                merged.append(current)
+                current = event
     
     if current is not None:
         merged.append(current)
@@ -393,12 +379,49 @@ def merge_overlaps_onset_aware(
     return merged
 
 
+def normalize_velocity_percentile(
+    events: list[NoteEvent],
+    percentile_min: float = 5.0,
+    percentile_max: float = 95.0,
+) -> list[NoteEvent]:
+    """基于 percentile 归一化 velocity，而不是固定 dB 映射"""
+    if not events:
+        return events
+    
+    velocities = np.array([e.velocity for e in events])
+    
+    v_min = np.percentile(velocities, percentile_min)
+    v_max = np.percentile(velocities, percentile_max)
+    
+    if v_max - v_min < 1.0:
+        return events
+    
+    normalized: list[NoteEvent] = []
+    
+    for event in events:
+        norm = (event.velocity - v_min) / (v_max - v_min)
+        norm = np.clip(norm, 0.0, 1.0)
+        
+        new_vel = int(round(norm * 116)) + 10
+        new_vel = int(np.clip(new_vel, 1, 127))
+        
+        normalized.append(NoteEvent(
+            note=event.note,
+            start_s=event.start_s,
+            end_s=event.end_s,
+            velocity=new_vel,
+            confidence=event.confidence,
+        ))
+    
+    return normalized
+
+
 def full_postprocess(
     events: list[NoteEvent],
     samples: np.ndarray | None = None,
     sample_rate: int = 44100,
     bpm: float = 120.0,
-    onset_times: list[float] | None = None,
+    onset_detector: OnsetDetector | None = None,
     config: PostProcessConfig | None = None,
 ) -> list[NoteEvent]:
     if config is None:
@@ -407,12 +430,20 @@ def full_postprocess(
     if not events:
         return events
     
-    events = apply_harmonic_masking(events, samples, sample_rate, config)
+    if onset_detector is None and samples is not None:
+        onset_detector = OnsetDetector(sample_rate)
+        onset_detector.detect(samples)
     
-    events = detect_repeated_notes_onset_aware(events, onset_times, config)
+    if onset_detector is None:
+        onset_detector = OnsetDetector(sample_rate)
     
-    if samples is not None:
-        events = refine_onsets_by_pitch(events, samples, sample_rate, config)
+    events = refine_onsets_from_global_detector(events, onset_detector, config)
+    
+    events = detect_repeated_notes_simple(events, onset_detector, config)
+    
+    events = merge_overlaps_onset_confidence_aware(events, onset_detector, config)
+    
+    events = apply_harmonic_confidence_adjustment(events, config)
     
     events = [
         NoteEvent(
@@ -420,16 +451,17 @@ def full_postprocess(
             start_s=max(0, e.start_s),
             end_s=max(e.start_s + config.min_note_duration_s, e.end_s),
             velocity=max(1, min(127, e.velocity)),
+            confidence=e.confidence,
         )
         for e in events
     ]
     
     events = smooth_velocities_savgol(events, config)
     
+    events = normalize_velocity_percentile(events)
+    
     if config.enable_quantization:
         events = quantize_onsets_gentle(events, bpm, config.quantize_division, threshold=0.15)
-    
-    events = merge_overlaps_onset_aware(events, onset_times)
     
     events.sort(key=lambda e: (e.start_s, e.note))
     

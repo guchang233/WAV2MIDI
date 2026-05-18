@@ -9,7 +9,7 @@ from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, resample_poly, stft, butter, sosfilt
 
 from audiomidi_app.midi import NoteEvent
-from audiomidi_app.postprocess import full_postprocess, PostProcessConfig
+from audiomidi_app.postprocess import full_postprocess, PostProcessConfig, OnsetDetector
 
 class NeuralTranscriber(Protocol):
     name: str
@@ -211,6 +211,7 @@ def apply_pedal_correction(
         start_s=e.start_s,
         end_s=e.end_s,
         velocity=e.velocity,
+        confidence=getattr(e, 'confidence', 1.0),
     ) for e in events]
     
     notes_by_pedal: dict[int, list[int]] = {}
@@ -251,13 +252,14 @@ def apply_pedal_correction(
                         start_s=note.start_s,
                         end_s=pedal_off,
                         velocity=note.velocity,
+                        confidence=getattr(note, 'confidence', 1.0),
                     )
     
     return events
 
 
 class SpectralPeaksTranscriber:
-    name = "Spectral Peaks"
+    name = "Spectral Peaks [DEBUG ONLY]"
 
     def __init__(self, config: SpectralPeaksConfig | None = None) -> None:
         self._cfg = config or SpectralPeaksConfig()
@@ -342,6 +344,7 @@ class SpectralPeaksTranscriber:
                                 start_s=start_s,
                                 end_s=now_s,
                                 velocity=amp_to_velocity(max_amp),
+                                confidence=0.5,
                             )
                         )
                     to_close.append(n)
@@ -357,6 +360,7 @@ class SpectralPeaksTranscriber:
                                     start_s=start_s,
                                     end_s=last_s,
                                     velocity=amp_to_velocity(max_amp),
+                                    confidence=0.5,
                                 )
                             )
                         to_close.append(n)
@@ -379,6 +383,7 @@ class SpectralPeaksTranscriber:
                         start_s=start_s,
                         end_s=last,
                         velocity=amp_to_velocity(max_amp),
+                        confidence=0.5,
                     )
                 )
         
@@ -387,7 +392,7 @@ class SpectralPeaksTranscriber:
 
 
 class HarmonicSalienceTranscriber:
-    name = "Harmonic Salience"
+    name = "Harmonic Salience [DEBUG ONLY]"
 
     def __init__(self, config: HarmonicSalienceConfig | None = None) -> None:
         self._cfg = config or HarmonicSalienceConfig()
@@ -487,6 +492,7 @@ class HarmonicSalienceTranscriber:
                                 start_s=start_s,
                                 end_s=now_s,
                                 velocity=amp_to_velocity(max_amp),
+                                confidence=0.5,
                             )
                         )
                     to_close.append(n)
@@ -502,6 +508,7 @@ class HarmonicSalienceTranscriber:
                                     start_s=start_s,
                                     end_s=last_s,
                                     velocity=amp_to_velocity(max_amp),
+                                    confidence=0.5,
                                 )
                             )
                         to_close.append(n)
@@ -524,6 +531,7 @@ class HarmonicSalienceTranscriber:
                         start_s=start_s,
                         end_s=last,
                         velocity=amp_to_velocity(max_amp),
+                        confidence=0.5,
                     )
                 )
         
@@ -554,6 +562,11 @@ def amp_to_velocity(amp: float, mode: str = "linear") -> int:
     return max(1, min(127, int(v)))
 
 
+def hz_to_midi(freqs: np.ndarray) -> np.ndarray:
+    midi = 69.0 + 12.0 * np.log2(np.maximum(freqs, 1e-9) / 440.0)
+    return np.clip(np.rint(midi), 0, 127).astype(int)
+
+
 def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
     by_note: dict[int, list[NoteEvent]] = {}
     for e in events:
@@ -570,6 +583,7 @@ def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
                     start_s=cur.start_s,
                     end_s=max(cur.end_s, nxt.end_s),
                     velocity=max(cur.velocity, nxt.velocity),
+                    confidence=max(getattr(cur, 'confidence', 1.0), getattr(nxt, 'confidence', 1.0)),
                 )
             else:
                 merged.append(cur)
@@ -581,12 +595,6 @@ def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
 
 
 def available_transcribers() -> list[Transcriber]:
-    """返回所有可用转录器，按优先级排序。
-    
-    架构分离：
-    - Neural Backend (主): PianoTranscription, BasicPitch
-    - DSP Backend (fallback): HarmonicSalience, SpectralPeaks
-    """
     transcribers: list[Transcriber] = []
     
     pt = try_piano_transcription_transcriber()
@@ -607,7 +615,6 @@ def available_transcribers() -> list[Transcriber]:
 
 
 def available_neural_transcribers() -> list[NeuralTranscriber]:
-    """仅返回 Neural 模型转录器（推荐）"""
     neural: list[NeuralTranscriber] = []
     
     pt = try_piano_transcription_transcriber()
@@ -622,7 +629,6 @@ def available_neural_transcribers() -> list[NeuralTranscriber]:
 
 
 def available_dsp_transcribers() -> list[DSPTranscriber]:
-    """返回 DSP fallback 转录器"""
     return [
         HarmonicSalienceTranscriber(),
         SpectralPeaksTranscriber(),
@@ -680,26 +686,11 @@ def try_piano_transcription_transcriber() -> NeuralTranscriber | None:
 
     class _PianoTranscriptionTranscriber:
         name = "Piano Transcription (Neural)"
-        
-        _onset_times: list[float] = []
 
         def __init__(self):
             from piano_transcription_inference import PianoTranscription
             self._model = PianoTranscription(device="cpu", duration=None)
             self._pedal_config = PedalConfig()
-
-        def get_onset_times(self, samples: np.ndarray, sample_rate: int) -> list[float]:
-            try:
-                import librosa
-                onset_frames = librosa.onset.onset_detect(
-                    y=samples, sr=sample_rate, hop_length=256,
-                    backtrack=True, units="time"
-                )
-                self._onset_times = onset_frames.tolist()
-                return self._onset_times
-            except Exception:
-                self._onset_times = []
-                return []
 
         def transcribe(self, samples: np.ndarray, sample_rate_in: int) -> list[NoteEvent]:
             import soundfile as sf
@@ -718,7 +709,8 @@ def try_piano_transcription_transcriber() -> NeuralTranscriber | None:
                 samples_resampled = samples
                 sample_rate_out = sample_rate_in
             
-            onset_times = self.get_onset_times(samples_resampled, sample_rate_out)
+            onset_detector = OnsetDetector(sample_rate_out)
+            onset_detector.detect(samples_resampled)
             
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, mode="wb") as f:
                 temp_wav = f.name
@@ -734,6 +726,7 @@ def try_piano_transcription_transcriber() -> NeuralTranscriber | None:
                         start_s=float(note_info["onset_time"]),
                         end_s=float(note_info["offset_time"]),
                         velocity=int(np.clip(note_info["velocity"] * 127, 1, 127)),
+                        confidence=1.0,
                     ))
                 
                 pedal_events = result.get("pedal", [])
@@ -744,7 +737,8 @@ def try_piano_transcription_transcriber() -> NeuralTranscriber | None:
                     events, 
                     samples_resampled, 
                     sample_rate_out,
-                    onset_times=onset_times,
+                    bpm=120.0,
+                    onset_detector=onset_detector,
                     config=None
                 )
                 
@@ -790,6 +784,7 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
                         start_s=float(note.start_time),
                         end_s=float(note.end_time),
                         velocity=int(min(127, max(1, note.amplitude * 127))),
+                        confidence=1.0,
                     ))
                 return events
             finally:
@@ -822,3 +817,252 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
             return os.fspath(midi_path)
 
     return _BasicPitchTranscriber()
+
+
+class ProductionPipeline:
+    """
+    Modern Production Transcription Pipeline
+    完整的现代 AI 扒谱系统架构
+    """
+    
+    name = "Production Transcription Pipeline"
+    
+    def __init__(
+        self,
+        use_separation: bool = True,
+        use_ensemble: bool = True,
+        enable_symbolic_refinement: bool = True,
+        enable_beat_tracking: bool = True,
+        config: dict | None = None,
+    ):
+        self._config = config or {}
+        
+        self._separator = None
+        self._router = None
+        self._symbolic_refiner = None
+        self._beat_tracker = None
+        self._renderer = None
+        
+        self._use_separation = use_separation
+        self._use_ensemble = use_ensemble
+        self._enable_symbolic_refinement = enable_symbolic_refinement
+        self._enable_beat_tracking = enable_beat_tracking
+        
+        self._initialize_components()
+    
+    def _initialize_components(self):
+        """初始化所有组件"""
+        if self._use_separation:
+            try:
+                from audiomidi_app.pipeline.separation import HTDemucsSeparator
+                self._separator = HTDemucsSeparator()
+            except Exception as e:
+                print(f"Warning: Stem separation unavailable: {e}")
+                self._separator = None
+        
+        if self._use_ensemble:
+            try:
+                from audiomidi_app.pipeline.transcription import EnsembleTranscriptionEngine
+                from audiomidi_app.pipeline.transcription import TranscriptionConfig
+                
+                config = TranscriptionConfig(
+                    use_separation=False,
+                    use_mt3=True,
+                    use_piano_transcription=True,
+                    use_basic_pitch=True,
+                )
+                self._router = EnsembleTranscriptionEngine(config)
+            except Exception as e:
+                print(f"Warning: Ensemble transcription unavailable: {e}")
+                self._router = None
+        
+        if self._enable_symbolic_refinement:
+            try:
+                from audiomidi_app.pipeline.symbolic_refinement import (
+                    SymbolicRefiner,
+                    SymbolicRefinementConfig,
+                )
+                
+                config = SymbolicRefinementConfig(
+                    enable_harmony_check=True,
+                    enable_voice_leading=True,
+                    enable_tempo_constraints=True,
+                )
+                self._symbolic_refiner = SymbolicRefiner(config)
+            except Exception as e:
+                print(f"Warning: Symbolic refinement unavailable: {e}")
+                self._symbolic_refiner = None
+        
+        if self._enable_beat_tracking:
+            try:
+                from audiomidi_app.rhythm.beat_tracking import BeatTracker
+                self._beat_tracker = BeatTracker()
+            except Exception as e:
+                print(f"Warning: Beat tracking unavailable: {e}")
+                self._beat_tracker = None
+    
+    def transcribe(
+        self,
+        samples: np.ndarray,
+        sample_rate: int = 44100,
+    ) -> list[NoteEvent]:
+        """
+        完整的 production transcription 流程
+        
+        Pipeline:
+        Audio → Stem Separation → Multi-Engine Transcription 
+                → Symbolic Refinement → Beat-Aligned Quantization → MIDI
+        """
+        try:
+            if self._separator is not None:
+                stems = self._separator.separate(samples, sample_rate)
+            else:
+                from audiomidi_app.pipeline.separation import SeparatedStems
+                stems = SeparatedStems(
+                    vocals=None,
+                    drums=None,
+                    bass=None,
+                    other=samples,
+                    mixture=samples,
+                    sample_rate=sample_rate,
+                )
+            
+            notes = self._transcribe_stems(stems)
+            
+            if self._beat_tracker is not None:
+                tempo_map = self._beat_tracker.track(samples, sample_rate)
+                notes = self._align_to_tempo(notes, tempo_map)
+            
+            if self._symbolic_refiner is not None:
+                notes = self._symbolic_refiner.refine(notes)
+            
+            notes = self._postprocess(notes, samples, sample_rate)
+            
+            notes.sort(key=lambda n: (n.start_s, n.note))
+            return notes
+            
+        except Exception as e:
+            print(f"Production pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def _transcribe_stems(self, stems) -> list[NoteEvent]:
+        """转录分离后的各个 stem"""
+        if self._router is not None:
+            try:
+                notes = self._router.transcribe(stems.other, stems.sample_rate)
+                return notes
+            except Exception as e:
+                print(f"Router transcription failed: {e}")
+        
+        from audiomidi_app.pipeline.transcription import PianoTranscriptionEngine
+        
+        engine = PianoTranscriptionEngine()
+        notes = engine.transcribe(stems.other, stems.sample_rate)
+        return notes
+    
+    def _align_to_tempo(self, notes: list[NoteEvent], tempo_map) -> list[NoteEvent]:
+        """将音符对齐到节拍"""
+        if not notes or not tempo_map.beats:
+            return notes
+        
+        aligned = []
+        for note in notes:
+            nearest_beat = tempo_map.get_nearest_beat(note.start_s)
+            
+            deviation = abs(note.start_s - nearest_beat.time)
+            threshold = 60.0 / tempo_map.bpm / 8
+            
+            if deviation < threshold and nearest_beat.confidence > 0.7:
+                note = NoteEvent(
+                    note=note.note,
+                    start_s=nearest_beat.time,
+                    end_s=note.end_s,
+                    velocity=note.velocity,
+                    confidence=getattr(note, 'confidence', 1.0),
+                )
+            
+            aligned.append(note)
+        
+        return aligned
+    
+    def _postprocess(
+        self,
+        notes: list[NoteEvent],
+        samples: np.ndarray,
+        sample_rate: int,
+    ) -> list[NoteEvent]:
+        """后处理"""
+        try:
+            from audiomidi_app.postprocess import full_postprocess
+            
+            notes = full_postprocess(
+                notes,
+                samples,
+                sample_rate,
+                bpm=120.0,
+            )
+        except Exception as e:
+            print(f"Postprocessing failed: {e}")
+        
+        return notes
+    
+    def transcribe_with_metadata(
+        self,
+        samples: np.ndarray,
+        sample_rate: int = 44100,
+    ) -> dict:
+        """
+        带元数据的转录
+        
+        Returns:
+            {
+                'notes': list[NoteEvent],
+                'tempo': float,
+                'beats': list[BeatInfo],
+                'stems_used': dict,
+            }
+        """
+        tempo_map = None
+        if self._beat_tracker is not None:
+            tempo_map = self._beat_tracker.track(samples, sample_rate)
+        
+        stems_used = {}
+        if self._separator is not None:
+            stems = self._separator.separate(samples, sample_rate)
+            stems_used = {
+                'vocals': stems.vocals is not None,
+                'drums': stems.drums is not None,
+                'bass': stems.bass is not None,
+                'other': stems.other is not None,
+            }
+        
+        notes = self.transcribe(samples, sample_rate)
+        
+        return {
+            'notes': notes,
+            'tempo': tempo_map.bpm if tempo_map else 120.0,
+            'beats': tempo_map.beats if tempo_map else [],
+            'stems_used': stems_used,
+        }
+
+
+def create_modern_pipeline() -> ProductionPipeline:
+    """创建现代 production pipeline"""
+    return ProductionPipeline(
+        use_separation=True,
+        use_ensemble=True,
+        enable_symbolic_refinement=True,
+        enable_beat_tracking=True,
+    )
+
+
+def create_simple_pipeline() -> ProductionPipeline:
+    """创建简化版 pipeline - 只用 Piano Transcription"""
+    return ProductionPipeline(
+        use_separation=False,
+        use_ensemble=False,
+        enable_symbolic_refinement=True,
+        enable_beat_tracking=True,
+    )
