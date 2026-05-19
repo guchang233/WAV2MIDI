@@ -431,9 +431,7 @@ def full_postprocess(
 
     if is_neural:
         # 神经网络转录器（Piano Transcription / Basic Pitch）输出质量高，
-        # 只需轻量处理，跳过所有激进的 DSP 修正步骤
-        events = smooth_velocities_savgol(events, config)
-        events = normalize_velocity_percentile(events)
+        # 跳过所有激进的 DSP 修正，只保留可选的量化
         if config.enable_quantization:
             events = quantize_onsets_gentle(events, bpm, config.quantize_division, threshold=0.15)
         events.sort(key=lambda e: (e.start_s, e.note))
