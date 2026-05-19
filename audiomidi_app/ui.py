@@ -187,11 +187,12 @@ def run_app() -> None:
             self.detail.emit(f"[{self._time()}]    时长: {duration:.2f} 秒")
             self.detail.emit(f"[{self._time()}]    采样数: {len(audio.samples):,}")
 
+            bpm = self._cfg.bpm
             if self._cfg.auto_bpm:
                 self.detail.emit(f"[{self._time()}] 自动检测 BPM...")
                 from audiomidi_app.transcribe import detect_bpm
-                detected = detect_bpm(audio.samples, audio.sample_rate)
-                self.detail.emit(f"[{self._time()}] ✅ BPM 检测完成: {detected:.1f}")
+                bpm = detect_bpm(audio.samples, audio.sample_rate)
+                self.detail.emit(f"[{self._time()}] ✅ BPM 检测完成: {bpm:.1f}")
 
             if self._interrupted:
                 return ""
@@ -233,12 +234,14 @@ def run_app() -> None:
             from audiomidi_app.postprocess import full_postprocess, PostProcessConfig, OnsetDetector
             onset_detector = OnsetDetector(audio.sample_rate)
             onset_detector.detect(audio.samples)
+            is_neural = self._cfg.engine in ("Piano Transcription (Neural)", "Basic Pitch")
             events = full_postprocess(
                 events,
                 samples=audio.samples,
                 sample_rate=audio.sample_rate,
-                bpm=self._cfg.bpm,
+                bpm=bpm,
                 onset_detector=onset_detector,
+                is_neural=is_neural,
             )
             self.detail.emit(f"[{self._time()}] ✅ 后处理完成")
             self.detail.emit(f"[{self._time()}]    剩余 {len(events)} 个音符")
@@ -272,13 +275,13 @@ def run_app() -> None:
                 self.detail.emit(f"[{self._time()}]    左手 Channel: {self._cfg.left_hand_channel}")
                 self.detail.emit(f"[{self._time()}]    右手 Channel: {self._cfg.right_hand_channel}")
                 mid = events_to_midi_with_hands(
-                    voice_result, 
-                    bpm=self._cfg.bpm,
+                    voice_result,
+                    bpm=bpm,
                     left_channel=self._cfg.left_hand_channel,
                     right_channel=self._cfg.right_hand_channel,
                 )
             else:
-                mid = events_to_midi(events, bpm=self._cfg.bpm)
+                mid = events_to_midi(events, bpm=bpm)
             
             mid.save(str(out_path))
             file_size = out_path.stat().st_size

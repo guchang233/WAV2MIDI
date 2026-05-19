@@ -630,11 +630,14 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
 
                 events = []
                 for note_info in result["est_note_events"]:
+                    # Piano Transcription 的 velocity 已乘过 velocity_scale=128，
+                    # 直接 clip 到 1-127 即可
+                    vel = int(np.clip(note_info["velocity"], 1, 127))
                     events.append(NoteEvent(
                         note=int(note_info["midi_note"]),
                         start_s=float(note_info["onset_time"]),
                         end_s=float(note_info["offset_time"]),
-                        velocity=int(np.clip(note_info["velocity"] * 127, 1, 127)),
+                        velocity=vel,
                         confidence=1.0,
                     ))
 
