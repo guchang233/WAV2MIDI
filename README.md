@@ -1,52 +1,55 @@
+# Audio → MIDI
 
-# Audio to MIDI Transcription System
+音频转 MIDI 工具，支持神经网络和 DSP 两种转录方式。
 
-音频转 MIDI 工具 - 提供基于 DSP 的精确转录功能。
+## 引擎
 
-## 功能说明
+| 引擎 | 类型 | 说明 |
+|---|---|---|
+| Piano Transcription | 神经网络 | 推荐，钢琴专用，精度最高 |
+| Basic Pitch | 神经网络 | 通用乐器，轻量快速 |
+| Harmonic Salience | DSP | 调试用途 |
+| Spectral Peaks | DSP | 调试用途 |
 
-本项目提供两种 DSP 音频转 MIDI 引擎：
-
-- **Harmonic Salience** - 谐波显著性检测（推荐，效果较好）
-- **Spectral Peaks** - 频谱峰值检测（速度快）
-
-## 快速开始
-
-### 安装依赖
+## 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 使用桌面应用
+可选安装神经网络引擎：
+
+```bash
+pip install piano-transcription-inference
+pip install basic-pitch
+```
+
+## 使用
+
+### 桌面应用
 
 ```bash
 python run_desktop.py
 ```
 
-### 使用命令行
+支持拖拽音频文件、自动检测 BPM、左右手分离、实时日志。
+
+### 命令行
 
 ```bash
 python -m audiomidi_app.cli --in input.wav --out output.mid
 ```
 
-### 使用 Python API
+### Python API
 
 ```python
-from audiomidi_app.transcribe import HarmonicSalienceTranscriber, SpectralPeaksTranscriber
-from audiomidi_app.midi import events_to_midi
 from audiomidi_app.audio import read_audio
+from audiomidi_app.transcribe import available_transcribers
+from audiomidi_app.midi import events_to_midi
 
-# Read audio
 audio = read_audio("input.wav", target_sr=None, mono=True)
-
-# Choose engine
-transcriber = HarmonicSalienceTranscriber()
-
-# Transcribe
+transcriber = available_transcribers()[0]  # 自动选择最佳引擎
 notes = transcriber.transcribe(audio.samples, audio.sample_rate)
-
-# Save to MIDI
 midi = events_to_midi(notes, bpm=120.0)
 midi.save("output.mid")
 ```
@@ -55,18 +58,12 @@ midi.save("output.mid")
 
 ```
 audiomidi_app/
-├── audio.py      - 音频读取与处理
-├── midi.py       - MIDI 文件生成
-├── transcribe.py - 核心转录引擎
-├── postprocess.py- 音符后处理
-├── voice_separation.py - 声部分离
-└── ui.py         - 桌面界面
+├── audio.py            音频读取
+├── midi.py             MIDI 生成
+├── transcribe.py       转录引擎
+├── postprocess.py      后处理
+├── voice_separation.py 声部分离
+├── ui.py               桌面界面
+├── cloud_client.py     云端客户端
+└── cloud_server.py     云端服务器
 ```
-
-## 测试系统
-
-```bash
-python quick_test.py
-```
-
-该脚本会生成一个 C 大和弦音频并测试转录功能。
