@@ -202,8 +202,8 @@ def apply_pedal_correction(
     notes_by_pedal: dict[int, list[int]] = {}
     
     for pedal_idx, pedal in enumerate(pedal_events):
-        pedal_on = float(pedal["start_time"])
-        pedal_off = float(pedal["end_time"])
+        pedal_on = float(pedal.get("start_time", pedal.get("onset_time", 0)))
+        pedal_off = float(pedal.get("end_time", pedal.get("offset_time", 0)))
         
         sustained_notes: list[int] = []
         
@@ -221,7 +221,7 @@ def apply_pedal_correction(
             continue
             
         pedal = pedal_events[pedal_idx]
-        pedal_off = float(pedal["end_time"])
+        pedal_off = float(pedal.get("end_time", pedal.get("offset_time", 0)))
         
         for note_idx in note_indices:
             note = events[note_idx]
@@ -511,7 +511,7 @@ class HarmonicSalienceTranscriber:
         end_s = sal_band.shape[1] * dt
         for n, (start_s, last_s, max_amp) in active.items():
             last = min(end_s, last_s)
-            dur = last_s - start_s
+            dur = last - start_s
             if dur >= self._cfg.min_note_s:
                 events.append(
                     NoteEvent(
@@ -623,10 +623,13 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
 
             try:
                 sf.write(temp_wav, samples_resampled, sample_rate_out)
-                result = self._model.transcribe(temp_wav, midi_path=None)
+                audio_arr, sr = sf.read(temp_wav, dtype="float32")
+                if audio_arr.ndim > 1:
+                    audio_arr = audio_arr.mean(axis=1)
+                result = self._model.transcribe(audio_arr, midi_path=None)
 
                 events = []
-                for note_info in result["notes"]:
+                for note_info in result["est_note_events"]:
                     events.append(NoteEvent(
                         note=int(note_info["midi_note"]),
                         start_s=float(note_info["onset_time"]),
@@ -635,7 +638,7 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
                         confidence=1.0,
                     ))
 
-                pedal_events = result.get("pedal", [])
+                pedal_events = result.get("est_pedal_events", [])
 
                 events = apply_pedal_correction(events, pedal_events, self._pedal_config)
 

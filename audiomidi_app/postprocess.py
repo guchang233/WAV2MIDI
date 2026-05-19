@@ -153,13 +153,12 @@ def refine_onsets_from_global_detector(
         onset_time = event.start_s
         
         nearby_onset = onset_detector.find_nearby_onset(
-            onset_time, 
-            threshold=config.onset_refinement_threshold_s * 8
+            onset_time,
+            threshold=0.04,
         )
-        
+
         if nearby_onset is not None:
-            if abs(nearby_onset - onset_time) <= config.onset_refinement_threshold_s:
-                onset_time = nearby_onset
+            onset_time = nearby_onset
         
         refined_events.append(NoteEvent(
             note=event.note,
@@ -422,28 +421,39 @@ def full_postprocess(
     bpm: float = 120.0,
     onset_detector: OnsetDetector | None = None,
     config: PostProcessConfig | None = None,
+    is_neural: bool = False,
 ) -> list[NoteEvent]:
     if config is None:
         config = PostProcessConfig()
-    
+
     if not events:
         return events
-    
+
+    if is_neural:
+        # 神经网络转录器（Piano Transcription / Basic Pitch）输出质量高，
+        # 只需轻量处理，跳过所有激进的 DSP 修正步骤
+        events = smooth_velocities_savgol(events, config)
+        events = normalize_velocity_percentile(events)
+        if config.enable_quantization:
+            events = quantize_onsets_gentle(events, bpm, config.quantize_division, threshold=0.15)
+        events.sort(key=lambda e: (e.start_s, e.note))
+        return events
+
     if onset_detector is None and samples is not None:
         onset_detector = OnsetDetector(sample_rate)
         onset_detector.detect(samples)
-    
+
     if onset_detector is None:
         onset_detector = OnsetDetector(sample_rate)
-    
+
     events = refine_onsets_from_global_detector(events, onset_detector, config)
-    
+
     events = detect_repeated_notes_simple(events, onset_detector, config)
-    
+
     events = merge_overlaps_onset_confidence_aware(events, onset_detector, config)
-    
+
     events = apply_harmonic_confidence_adjustment(events, config)
-    
+
     events = [
         NoteEvent(
             note=e.note,
@@ -454,15 +464,17 @@ def full_postprocess(
         )
         for e in events
     ]
-    
-    # 先归一化，再平滑（避免平滑后的相对关系被归一化破坏）
-    events = normalize_velocity_percentile(events)
-    
+
     events = smooth_velocities_savgol(events, config)
-    
+
+    events = normalize_velocity_percentile(events)
+
+    confidence_threshold = 0.35
+    events = [e for e in events if e.confidence >= confidence_threshold]
+
     if config.enable_quantization:
         events = quantize_onsets_gentle(events, bpm, config.quantize_division, threshold=0.15)
-    
+
     events.sort(key=lambda e: (e.start_s, e.note))
-    
+
     return events

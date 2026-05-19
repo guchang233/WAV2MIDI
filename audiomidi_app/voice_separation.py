@@ -354,7 +354,7 @@ def assign_voices_beam_search(
             cost_std = np.std(costs)
             if cost_std < 1.0:
                 for i in range(len(beam)):
-                    beam[i].total_cost += np.random.uniform(0, 5)
+                    beam[i].total_cost += i * 0.001
                 heapq.heapify(beam)
     
     if not beam:

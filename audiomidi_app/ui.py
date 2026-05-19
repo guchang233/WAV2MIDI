@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,32 @@ def run_app() -> None:
     if _qt_import_error is not None:
         raise RuntimeError(f"桌面UI依赖加载失败：{_qt_import_error}")
 
+    class _SignalStream:
+        def __init__(self, emit_fn):
+            self._emit = emit_fn
+            self._buf = io.StringIO()
+
+        def write(self, text: str) -> int:
+            self._buf.write(text)
+            if '\n' in text:
+                self.flush()
+            return len(text)
+
+        def flush(self) -> None:
+            val = self._buf.getvalue()
+            if not val:
+                return
+            lines = val.split('\n')
+            for line in lines[:-1]:
+                if line:
+                    self._emit(line)
+            self._buf = io.StringIO()
+            if lines[-1]:
+                self._buf.write(lines[-1])
+
+        def isatty(self) -> bool:
+            return False
+
     class Worker(QObject):
         progress = Signal(str)
         detail = Signal(str)
@@ -71,7 +99,7 @@ def run_app() -> None:
         failed = Signal(str)
         notes_found = Signal(int)
         voices_found = Signal(int)
-        
+
         def __init__(self, cfg: JobConfig) -> None:
             super().__init__()
             self._cfg = cfg
@@ -80,7 +108,15 @@ def run_app() -> None:
         def interrupt(self) -> None:
             self._interrupted = True
 
+        def _emit_stdout(self, line: str) -> None:
+            self.detail.emit(f"[{self._time()}] [stdout] {line}")
+
         def run(self) -> None:
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            stream = _SignalStream(self._emit_stdout)
+            sys.stdout = stream
+            sys.stderr = stream
             try:
                 self.progress.emit("🚀 开始转谱")
                 self.progress_percent.emit(0)
@@ -98,6 +134,10 @@ def run_app() -> None:
             except Exception as e:
                 if not self._interrupted:
                     self.failed.emit(str(e))
+            finally:
+                stream.flush()
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
 
         def _time(self) -> str:
             return datetime.now().strftime("%H:%M:%S")
@@ -575,6 +615,12 @@ def run_app() -> None:
                 self._worker.interrupt()
             self._status.setText("正在停止...")
             self._log(f"[{datetime.now().strftime('%H:%M:%S')}] 用户请求停止...")
+
+            if self._thread is not None and self._thread.isRunning():
+                self._thread.quit()
+                if not self._thread.wait(2000):
+                    self._thread.terminate()
+                    self._thread.wait()
 
         def _on_done(self, out_path: str) -> None:
             if out_path:
