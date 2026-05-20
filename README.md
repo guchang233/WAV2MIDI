@@ -6,8 +6,8 @@
 
 | 引擎 | 类型 | 说明 |
 |---|---|---|
+| Piano Transcription (Neural) | 神经网络 | 钢琴专用，支持 GPU | 推荐,目前效果最好 |
 | Ensemble (PT + BP) | 神经网络融合 | 推荐，PT+BP 取并集 |
-| Piano Transcription (Neural) | 神经网络 | 钢琴专用，支持 GPU |
 | Basic Pitch | 神经网络 | 通用乐器，可调阈值 |
 | Harmonic Salience | DSP | 调试用 |
 | Spectral Peaks | DSP | 调试用 |
