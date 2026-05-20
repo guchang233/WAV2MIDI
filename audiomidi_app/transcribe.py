@@ -202,8 +202,11 @@ def apply_pedal_correction(
     notes_by_pedal: dict[int, list[int]] = {}
     
     for pedal_idx, pedal in enumerate(pedal_events):
-        pedal_on = float(pedal.get("start_time", pedal.get("onset_time", 0)))
-        pedal_off = float(pedal.get("end_time", pedal.get("offset_time", 0)))
+        pedal_on = float(pedal.get("onset_time") or pedal.get("start_time") or pedal.get("on_time") or 0.0)
+        pedal_off = float(pedal.get("offset_time") or pedal.get("end_time") or pedal.get("off_time") or 0.0)
+
+        if pedal_off <= pedal_on:
+            continue
         
         sustained_notes: list[int] = []
         
@@ -221,7 +224,7 @@ def apply_pedal_correction(
             continue
             
         pedal = pedal_events[pedal_idx]
-        pedal_off = float(pedal.get("end_time", pedal.get("offset_time", 0)))
+        pedal_off = float(pedal.get("offset_time") or pedal.get("end_time") or pedal.get("off_time") or 0.0)
         
         for note_idx in note_indices:
             note = events[note_idx]
@@ -565,7 +568,7 @@ def merge_overlaps(events: list[NoteEvent]) -> list[NoteEvent]:
         es.sort(key=lambda x: x.start_s)
         cur = es[0]
         for nxt in es[1:]:
-            if nxt.start_s <= cur.end_s + 1e-3:
+            if nxt.start_s < cur.end_s - 0.01:
                 cur = NoteEvent(
                     note=note,
                     start_s=cur.start_s,
@@ -628,11 +631,12 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
                     audio_arr = audio_arr.mean(axis=1)
                 result = self._model.transcribe(audio_arr, midi_path=None)
 
+                note_list = result.get("notes") or result.get("est_note_events") or []
+                pedal_list = result.get("pedals") or result.get("est_pedal_events") or []
+
                 events = []
-                for note_info in result["est_note_events"]:
-                    # Piano Transcription 的 velocity 已乘过 velocity_scale=128，
-                    # 直接 clip 到 1-127 即可
-                    vel = int(np.clip(note_info["velocity"], 1, 127))
+                for note_info in note_list:
+                    vel = int(np.clip(note_info.get("velocity", 64), 1, 127))
                     events.append(NoteEvent(
                         note=int(note_info["midi_note"]),
                         start_s=float(note_info["onset_time"]),
@@ -641,7 +645,7 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
                         confidence=1.0,
                     ))
 
-                pedal_events = result.get("est_pedal_events", [])
+                pedal_events = pedal_list
 
                 events = apply_pedal_correction(events, pedal_events, self._pedal_config)
 
@@ -694,20 +698,20 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
 
                 events = []
                 for note in note_events:
-                    # note_events is a list of tuples: (start_time, end_time, pitch, amplitude, ...)
                     if isinstance(note, tuple):
                         start_time, end_time, pitch, amplitude = note[0], note[1], note[2], note[3]
                     else:
-                        # For older versions that return objects
                         start_time = note.start_time
                         end_time = note.end_time
                         pitch = note.pitch
                         amplitude = note.amplitude
+                    raw_vel = float(amplitude)
+                    velocity = int(np.clip(raw_vel ** 0.5 * 127, 1, 127))
                     events.append(NoteEvent(
                         note=int(pitch),
                         start_s=float(start_time),
                         end_s=float(end_time),
-                        velocity=int(min(127, max(1, amplitude * 127))),
+                        velocity=velocity,
                         confidence=1.0,
                     ))
                 return events

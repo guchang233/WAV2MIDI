@@ -430,8 +430,18 @@ def full_postprocess(
         return events
 
     if is_neural:
-        # 神经网络转录器（Piano Transcription / Basic Pitch）输出质量高，
-        # 跳过所有激进的 DSP 修正，只保留可选的量化
+        from audiomidi_app.transcribe import merge_overlaps
+        events = merge_overlaps(events)
+        events = [
+            NoteEvent(
+                note=e.note,
+                start_s=max(0, e.start_s),
+                end_s=max(e.start_s + 0.03, e.end_s),
+                velocity=max(1, min(127, e.velocity)),
+                confidence=e.confidence,
+            )
+            for e in events
+        ]
         if config.enable_quantization:
             events = quantize_onsets_gentle(events, bpm, config.quantize_division, threshold=0.15)
         events.sort(key=lambda e: (e.start_s, e.note))
@@ -463,9 +473,9 @@ def full_postprocess(
         for e in events
     ]
 
-    events = smooth_velocities_savgol(events, config)
-
     events = normalize_velocity_percentile(events)
+
+    events = smooth_velocities_savgol(events, config)
 
     confidence_threshold = 0.35
     events = [e for e in events if e.confidence >= confidence_threshold]
