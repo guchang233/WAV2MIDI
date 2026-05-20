@@ -892,7 +892,87 @@ class VoiceSeparationTranscriber:
         for voice in result.voices:
             all_notes.extend(voice.notes)
         return sorted(all_notes, key=lambda n: (n.start_s, n.note))
-    
+
     def separate(self, samples: np.ndarray, sample_rate: int) -> VoiceSeparationResult:
         events = self._base.transcribe(samples, sample_rate)
         return separate_voices(events, self._voice_config)
+
+
+@dataclass(frozen=True)
+class BatchJobItem:
+    audio_path: str
+    out_path: str
+
+
+def batch_transcribe(
+    items: list[BatchJobItem],
+    engine_name: str,
+    cfg: dict | None = None,
+    progress_callback=None,
+) -> list[str]:
+    from audiomidi_app.audio import read_audio
+    from audiomidi_app.midi import events_to_midi
+    from audiomidi_app.postprocess import full_postprocess, PostProcessConfig, OnsetDetector
+
+    transcribers = available_transcribers()
+    transcriber = None
+    for t in transcribers:
+        if t.name == engine_name:
+            transcriber = t
+            break
+    if transcriber is None:
+        raise RuntimeError(f"未找到引擎: {engine_name}")
+
+    if cfg and hasattr(transcriber, '_onset_threshold') and hasattr(transcriber, '_frame_threshold'):
+        transcriber._onset_threshold = cfg.get("bp_onset_threshold", 0.35)
+        transcriber._frame_threshold = cfg.get("bp_frame_threshold", 0.20)
+    if cfg and hasattr(transcriber, '_bp') and hasattr(transcriber._bp, '_onset_threshold'):
+        transcriber._bp._onset_threshold = cfg.get("bp_onset_threshold", 0.35)
+        transcriber._bp._frame_threshold = cfg.get("bp_frame_threshold", 0.20)
+
+    is_neural = engine_name in ("Piano Transcription (Neural)", "Basic Pitch", "Ensemble (PT + BP)")
+    pp_config = PostProcessConfig(
+        confidence_threshold=(cfg or {}).get("confidence_threshold", 0.2),
+        enable_velocity_normalize=(cfg or {}).get("velocity_stretch", True),
+    )
+
+    results: list[str] = []
+    total = len(items)
+    for idx, item in enumerate(items):
+        if progress_callback:
+            progress_callback(idx, total, item.audio_path)
+
+        audio = read_audio(
+            item.audio_path,
+            normalize=(cfg or {}).get("normalize", True),
+            normalize_mode="rms" if is_neural else "peak",
+            preemphasis=(cfg or {}).get("preemphasis", False) and not is_neural,
+        )
+
+        bpm = (cfg or {}).get("bpm", 120.0)
+        if (cfg or {}).get("auto_bpm", False):
+            bpm = detect_bpm(audio.samples, audio.sample_rate)
+
+        events = transcriber.transcribe(audio.samples, audio.sample_rate)
+
+        onset_detector = OnsetDetector(audio.sample_rate)
+        onset_detector.detect(audio.samples)
+        events = full_postprocess(
+            events,
+            samples=audio.samples,
+            sample_rate=audio.sample_rate,
+            bpm=bpm,
+            onset_detector=onset_detector,
+            config=pp_config,
+            is_neural=is_neural,
+        )
+
+        Path(item.out_path).parent.mkdir(parents=True, exist_ok=True)
+        mid = events_to_midi(events, bpm=bpm)
+        mid.save(item.out_path)
+        results.append(item.out_path)
+
+    if progress_callback:
+        progress_callback(total, total, "")
+
+    return results

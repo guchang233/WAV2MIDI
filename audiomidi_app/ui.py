@@ -508,6 +508,11 @@ def run_app() -> None:
 
             self._thread: QThread | None = None
             self._worker: Worker | None = None
+            self._batch_items: list = []
+            self._batch_engine: str = ""
+            self._batch_cfg: dict = {}
+            self._batch_idx: int = 0
+            self._batch_results: list = []
 
         def _setup_ui(self) -> None:
             root = QWidget()
@@ -526,8 +531,10 @@ def run_app() -> None:
             file_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
             file_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
-            self._audio_path = QLineEdit()
-            self._audio_path.setPlaceholderText("拖拽音频文件至此，或通过右侧定位...")
+            self._audio_path = QTextEdit()
+            self._audio_path.setPlaceholderText("拖拽音频文件至此，或通过右侧定位...\n支持同时导入多个文件批量处理")
+            self._audio_path.setMaximumHeight(60)
+            self._audio_path.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
             pick_audio = QPushButton("浏览...")
             pick_audio.setFixedWidth(54)
             pick_audio.clicked.connect(self._on_pick_audio)
@@ -538,6 +545,7 @@ def run_app() -> None:
             file_layout.addRow("音频输入", row_audio)
 
             self._out_path = QLineEdit()
+            self._out_path.setText(str(Path.cwd() / "output"))
             self._out_path.setPlaceholderText("MIDI 文件存储目录路径")
             pick_out = QPushButton("浏览...")
             pick_out.setFixedWidth(54)
@@ -710,7 +718,7 @@ def run_app() -> None:
             log_header.setStyleSheet("background-color: #121212; border-bottom: 1px solid #222222;")
             log_header_layout = QHBoxLayout(log_header)
             log_header_layout.setContentsMargins(8, 2, 8, 2)
-            log_title = QLabel("实时控制台输出")
+            log_title = QLabel("控制台输出")
             log_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #555555;")
             log_header_layout.addWidget(log_title)
             log_header_layout.addStretch()
@@ -727,7 +735,7 @@ def run_app() -> None:
             self._log_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
             log_layout.addWidget(self._log_text)
 
-            tabs.addTab(tab_log, "实时日志")
+            tabs.addTab(tab_log, "日志")
 
             main_layout.addWidget(tabs, 1)
 
@@ -773,9 +781,11 @@ def run_app() -> None:
 
             main_layout.addWidget(footer)
 
-        def _log(self, msg: str) -> None:
+        def _log(self, msg: str, color: str | None = None) -> None:
             escaped_msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            if "✅" in msg:
+            if color:
+                html_msg = f"<span style='color: {color};'>{escaped_msg}</span>"
+            elif "✅" in msg:
                 html_msg = f"<span style='color: #4ade80;'>{escaped_msg}</span>"
             elif "❌" in msg or "异常" in msg or "失败" in msg or "ERR" in msg:
                 html_msg = f"<span style='color: #f87171;'>{escaped_msg}</span>"
@@ -804,15 +814,17 @@ def run_app() -> None:
             event.ignore()
 
         def dropEvent(self, event: QDropEvent) -> None:
+            paths = []
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     path = url.toLocalFile()
                     if Path(path).suffix.lower() in ['.wav', '.flac', '.ogg', '.mp3', '.m4a']:
-                        self._audio_path.setText(path)
-                        audio_dir = str(Path(path).parent)
-                        if not self._out_path.text().strip():
-                            self._out_path.setText(audio_dir)
-                        return
+                        paths.append(path)
+            if paths:
+                self._audio_path.setText(paths[0])
+                if len(paths) > 1:
+                    self._audio_path.setText("\n".join(paths))
+                    self._status.setText(f"已导入 {len(paths)} 个文件")
 
         def _on_voice_sep_toggled(self, state: int) -> None:
             enabled = state == Qt.Checked.value
@@ -824,17 +836,16 @@ def run_app() -> None:
             self._cloud_url.setEnabled(state == Qt.Checked.value)
 
         def _on_pick_audio(self) -> None:
-            # 💡 【文件选择对话框文本完全汉化】
-            path, _ = QFileDialog.getOpenFileName(
-                self, 
-                "定位音频源文件", 
-                "", 
+            paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "选择音频文件（可多选）",
+                "",
                 "音频格式 (*.wav *.flac *.ogg *.mp3 *.m4a);;全部文件 (*)"
             )
-            if path:
-                self._audio_path.setText(path)
-                if not self._out_path.text().strip():
-                    self._out_path.setText(str(Path(path).parent))
+            if paths:
+                self._audio_path.setPlainText("\n".join(paths))
+                n = len(paths)
+                self._status.setText(f"已导入 {n} 个文件" if n > 1 else "已导入 1 个文件")
 
         def _on_pick_out(self) -> None:
             # 💡 【文件夹选择对话框文本汉化】
@@ -868,38 +879,134 @@ def run_app() -> None:
             if self._thread is not None:
                 return
 
-            audio = self._audio_path.text().strip()
+            raw = self._audio_path.toPlainText().strip()
             outp = self._out_path.text().strip()
-            if not audio or not outp or not Path(audio).exists():
-                self._status.setText("错误: 输入输出路径配置非法或源文件不存在")
+            if not raw or not outp:
+                self._status.setText("错误: 请选择音频文件和输出目录")
                 return
 
-            cfg = JobConfig(
-                audio_path=audio,
-                out_dir=outp,
-                engine=self._engine.currentText(),
-                bpm=self._bpm.value(),
-                auto_bpm=self._auto_bpm.isChecked(),
-                cloud_enabled=self._cloud.isChecked(),
-                cloud_base_url=self._cloud_url.text().strip(),
-                use_voice_separation=self._use_voice_sep.isChecked(),
-                split_hands=self._split_hands.isChecked(),
-                left_hand_channel=self._left_channel.value(),
-                right_hand_channel=self._right_channel.value(),
-                normalize_audio=self._normalize.isChecked(),
-                preemphasis_audio=self._preemphasis.isChecked(),
-                velocity_stretch=self._velocity_stretch.isChecked(),
-                confidence_threshold=self._confidence_threshold.value(),
-                bp_onset_threshold=self._bp_onset_threshold.value(),
-                bp_frame_threshold=self._bp_frame_threshold.value(),
-            )
+            audio_paths = [p.strip() for p in raw.split("\n") if p.strip()]
+            audio_paths = [p for p in audio_paths if Path(p).exists()]
+            if not audio_paths:
+                self._status.setText("错误: 音频文件不存在")
+                return
 
-            self._set_ui_running(True)
-            self._status.setText("准备中...")
-            self._notes_label.setText("音符: -")
-            self._voices_label.setText("声部分离: -")
-            self._log_text.clear()
-            self._log(f"====== 开始转谱: {cfg.engine} | BPM: {cfg.bpm} ======")
+            if len(audio_paths) == 1:
+                cfg = JobConfig(
+                    audio_path=audio_paths[0],
+                    out_dir=outp,
+                    engine=self._engine.currentText(),
+                    bpm=self._bpm.value(),
+                    auto_bpm=self._auto_bpm.isChecked(),
+                    cloud_enabled=self._cloud.isChecked(),
+                    cloud_base_url=self._cloud_url.text().strip(),
+                    use_voice_separation=self._use_voice_sep.isChecked(),
+                    split_hands=self._split_hands.isChecked(),
+                    left_hand_channel=self._left_channel.value(),
+                    right_hand_channel=self._right_channel.value(),
+                    normalize_audio=self._normalize.isChecked(),
+                    preemphasis_audio=self._preemphasis.isChecked(),
+                    velocity_stretch=self._velocity_stretch.isChecked(),
+                    confidence_threshold=self._confidence_threshold.value(),
+                    bp_onset_threshold=self._bp_onset_threshold.value(),
+                    bp_frame_threshold=self._bp_frame_threshold.value(),
+                )
+
+                self._set_ui_running(True)
+                self._status.setText("准备中...")
+                self._notes_label.setText("音符: -")
+                self._voices_label.setText("声部分离: -")
+                self._log_text.clear()
+                self._log(f"====== 开始转谱: {cfg.engine} | BPM: {cfg.bpm} ======")
+
+                self._thread = QThread()
+                self._worker = Worker(cfg)
+                self._worker.moveToThread(self._thread)
+                self._thread.started.connect(self._worker.run)
+                self._worker.progress.connect(self._on_progress)
+                self._worker.detail.connect(self._log)
+                self._worker.progress_percent.connect(self._progress.setValue)
+                self._worker.notes_found.connect(lambda n: self._notes_label.setText(f"音符: {n}"))
+                self._worker.voices_found.connect(lambda n: self._voices_label.setText(f"声部分离: {n}"))
+                self._worker.done.connect(self._on_done)
+                self._worker.failed.connect(self._on_failed)
+                self._worker.done.connect(self._thread.quit)
+                self._worker.failed.connect(self._thread.quit)
+                self._thread.finished.connect(self._cleanup_thread)
+                self._thread.start()
+            else:
+                from audiomidi_app.transcribe import BatchJobItem, batch_transcribe
+
+                items = []
+                out_dir = Path(outp)
+                for p in audio_paths:
+                    out_path = out_dir / Path(p).with_suffix(".mid").name
+                    items.append(BatchJobItem(audio_path=p, out_path=str(out_path)))
+
+                engine_name = self._engine.currentText()
+                cfg_dict = {
+                    "bpm": self._bpm.value(),
+                    "auto_bpm": self._auto_bpm.isChecked(),
+                    "normalize": self._normalize.isChecked(),
+                    "preemphasis": self._preemphasis.isChecked(),
+                    "velocity_stretch": self._velocity_stretch.isChecked(),
+                    "confidence_threshold": self._confidence_threshold.value(),
+                    "bp_onset_threshold": self._bp_onset_threshold.value(),
+                    "bp_frame_threshold": self._bp_frame_threshold.value(),
+                }
+
+                self._set_ui_running(True)
+                self._status.setText(f"批量转谱 0/{len(items)}")
+                self._notes_label.setText("音符: -")
+                self._voices_label.setText("声部分离: -")
+                self._log_text.clear()
+                self._log(f"====== 批量转谱: {len(items)} 个文件 | 引擎: {engine_name} ======")
+                self._log(f"📋 共 {len(items)} 个文件，将逐个处理", "#60a5fa")
+                for i, it in enumerate(items, 1):
+                    self._log(f"  [{i}/{len(items)}] {Path(it.audio_path).name}", "#60a5fa")
+                self._progress.setVisible(True)
+                self._progress.setRange(0, len(items))
+
+                self._batch_items = items
+                self._batch_engine = engine_name
+                self._batch_cfg = cfg_dict
+                self._batch_idx = 0
+                self._batch_results = []
+
+                self._run_next_batch()
+
+        def _run_next_batch(self) -> None:
+            if self._batch_idx >= len(self._batch_items):
+                n = len(self._batch_results)
+                self._log(f"====== 批量转谱完成: {n}/{len(self._batch_items)} 成功 ======")
+                self._log(f"📋 全部 {len(self._batch_items)} 个文件处理完毕，成功 {n} 个", "#60a5fa")
+                self._status.setText(f"✅ 批量完成 {n}/{len(self._batch_items)}")
+                self._set_ui_running(False)
+                self._progress.setValue(len(self._batch_items))
+                return
+
+            item = self._batch_items[self._batch_idx]
+            self._log(f"▶ 开始处理 [{self._batch_idx + 1}/{len(self._batch_items)}]: {Path(item.audio_path).name}", "#60a5fa")
+
+            cfg = JobConfig(
+                audio_path=item.audio_path,
+                out_dir=str(Path(item.out_path).parent),
+                engine=self._batch_engine,
+                bpm=self._batch_cfg.get("bpm", 120.0),
+                auto_bpm=self._batch_cfg.get("auto_bpm", False),
+                cloud_enabled=False,
+                cloud_base_url="",
+                use_voice_separation=False,
+                split_hands=False,
+                left_hand_channel=1,
+                right_hand_channel=2,
+                normalize_audio=self._batch_cfg.get("normalize", True),
+                preemphasis_audio=self._batch_cfg.get("preemphasis", False),
+                velocity_stretch=self._batch_cfg.get("velocity_stretch", True),
+                confidence_threshold=self._batch_cfg.get("confidence_threshold", 0.2),
+                bp_onset_threshold=self._batch_cfg.get("bp_onset_threshold", 0.35),
+                bp_frame_threshold=self._batch_cfg.get("bp_frame_threshold", 0.20),
+            )
 
             self._thread = QThread()
             self._worker = Worker(cfg)
@@ -907,15 +1014,36 @@ def run_app() -> None:
             self._thread.started.connect(self._worker.run)
             self._worker.progress.connect(self._on_progress)
             self._worker.detail.connect(self._log)
-            self._worker.progress_percent.connect(self._progress.setValue)
+            self._worker.progress_percent.connect(lambda _: None)
             self._worker.notes_found.connect(lambda n: self._notes_label.setText(f"音符: {n}"))
-            self._worker.voices_found.connect(lambda n: self._voices_label.setText(f"声部分离: {n}"))
-            self._worker.done.connect(self._on_done)
-            self._worker.failed.connect(self._on_failed)
-            self._worker.done.connect(self._thread.quit)
-            self._worker.failed.connect(self._thread.quit)
-            self._thread.finished.connect(self._cleanup_thread)
+
+            def _on_batch_done(out_path: str) -> None:
+                if out_path:
+                    self._batch_results.append(out_path)
+                self._progress.setValue(self._batch_idx + 1)
+                self._status.setText(f"批量转谱 {self._batch_idx + 1}/{len(self._batch_items)}")
+                self._batch_idx += 1
+                self._thread.quit()
+
+            def _on_batch_failed(msg: str) -> None:
+                self._log(f"❌ 失败: {msg}")
+                self._progress.setValue(self._batch_idx + 1)
+                self._batch_idx += 1
+                self._thread.quit()
+
+            self._worker.done.connect(_on_batch_done)
+            self._worker.failed.connect(_on_batch_failed)
+            self._thread.finished.connect(self._cleanup_batch_thread)
             self._thread.start()
+
+        def _cleanup_batch_thread(self) -> None:
+            if self._worker:
+                self._worker.deleteLater()
+            if self._thread:
+                self._thread.deleteLater()
+            self._thread = None
+            self._worker = None
+            QTimer.singleShot(50, self._run_next_batch)
 
         def _on_progress(self, msg: str) -> None:
             self._status.setText(msg)
