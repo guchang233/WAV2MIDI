@@ -1,0 +1,6 @@
+{
+  "name": "Audio to MIDI Converter",
+  "description": "Convert audio files to MIDI using deep learning and neural piano transcription engines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
