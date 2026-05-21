@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, resample_poly, stft, butter, sosfilt
 
+from audiomidi_app.paths import PT_MODEL_PATH, PT_MODEL_DIR, BP_MODEL_PATH
 from audiomidi_app.midi import NoteEvent
 from audiomidi_app.postprocess import full_postprocess, PostProcessConfig, OnsetDetector
 
@@ -592,10 +594,10 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
     except Exception:
         return None
 
-    # Also check for model file
-    from pathlib import Path
-    model_path = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
-    if not model_path.exists():
+    # Also check for model file (支持自定义路径和默认路径)
+    default_pt_path = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
+    pt_model_file = PT_MODEL_PATH if PT_MODEL_PATH.exists() else (default_pt_path if default_pt_path.exists() else None)
+    if pt_model_file is None:
         return None
 
     class _PianoTranscriptionTranscriber:
@@ -610,7 +612,8 @@ def try_piano_transcription_transcriber() -> Transcriber | None:
             except Exception:
                 device = "cpu"
             print(f"[Piano Transcription] 使用设备: {device}")
-            self._model = PianoTranscription(device=device)
+            checkpoint = str(PT_MODEL_PATH) if PT_MODEL_PATH.exists() else str(default_pt_path)
+            self._model = PianoTranscription(device=device, checkpoint_path=checkpoint)
             self._pedal_config = PedalConfig()
 
         def _transcribe_segment(self, audio_arr: np.ndarray, sample_rate_out: int) -> tuple[list[NoteEvent], list[dict]]:
@@ -744,13 +747,15 @@ def try_basic_pitch_transcriber() -> Transcriber | None:
         name = "Basic Pitch"
 
         def __init__(self, onset_threshold: float = 0.35, frame_threshold: float = 0.20):
-            from pathlib import Path
-            tf_model_path = Path(ICASSP_2022_MODEL_PATH)
-            onnx_model_path = tf_model_path.parent / "nmp.onnx"
-            if onnx_model_path.exists():
-                self._model_path = str(onnx_model_path)
+            if BP_MODEL_PATH.exists():
+                self._model_path = str(BP_MODEL_PATH)
             else:
-                self._model_path = ICASSP_2022_MODEL_PATH
+                tf_model_path = Path(ICASSP_2022_MODEL_PATH)
+                onnx_model_path = tf_model_path.parent / "nmp.onnx"
+                if onnx_model_path.exists():
+                    self._model_path = str(onnx_model_path)
+                else:
+                    self._model_path = ICASSP_2022_MODEL_PATH
             self._onset_threshold = onset_threshold
             self._frame_threshold = frame_threshold
 
